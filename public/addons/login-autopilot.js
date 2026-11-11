@@ -9,7 +9,7 @@
   "use strict";
   if (window.__bcaLoginAutopilot) return;
   window.__bcaLoginAutopilot = true;
-  console.log("[bca] login-autopilot v7 loaded");
+  // silent (owner request 2026-11-08: no console noise)
 
   function visiblePassword() {
     for (const el of document.querySelectorAll('input[type="password"]')) {

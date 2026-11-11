@@ -38962,6 +38962,7 @@ var require_storageTypes = __commonJS({
       StorageModels2["Setting"] = "Setting";
       StorageModels2["Message"] = "Message";
       StorageModels2["Note"] = "Note";
+      StorageModels2["Media"] = "Media";
     })(StorageModels || (exports2.StorageModels = StorageModels = {}));
     var StorageTypes;
     (function(StorageTypes2) {
@@ -59150,6 +59151,180 @@ var require_htmlSanitizer = __commonJS({
   }
 });
 
+// server/src/services/mediaStore.js
+var require_mediaStore = __commonJS({
+  "server/src/services/mediaStore.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.MEDIA_MAX_BASE64_CHARS = exports2.MAX_MEDIA_SECONDS = void 0;
+    exports2.putMedia = putMedia;
+    exports2.getMedia = getMedia;
+    exports2.removeMedia = removeMedia;
+    exports2.removeAllMedia = removeAllMedia;
+    exports2.mediaInfo = mediaInfo;
+    var logger_1 = require_logger2();
+    var Storage_1 = require_storageTypes();
+    var ShardedNoteRepository_1 = require_ShardedNoteRepository();
+    var DiskStorageRepositoryImpl_1 = require_DiskStorageRepositoryImpl();
+    var log = (0, logger_1.default)(__filename);
+    var MAX_MEDIA_SECONDS = 180;
+    exports2.MAX_MEDIA_SECONDS = MAX_MEDIA_SECONDS;
+    var MEDIA_MAX_BASE64_CHARS = 3e5;
+    exports2.MEDIA_MAX_BASE64_CHARS = MEDIA_MAX_BASE64_CHARS;
+    var mediaRepository = null;
+    function getMediaRepository() {
+      if (!mediaRepository) {
+        const defaultStorage = process.env.REPOSITORY_NAME || Storage_1.StorageTypes.diskStorage;
+        const storageType = defaultStorage === Storage_1.StorageTypes.githubGistStorage ? Storage_1.StorageTypes.githubGistStorage : Storage_1.StorageTypes.diskStorage;
+        if (storageType === Storage_1.StorageTypes.githubGistStorage) {
+          const token = process.env.githubGist_token ?? "";
+          const username = process.env.githubGist_username ?? "";
+          if (!token || !username) {
+            log.error("githubGist env vars are required for githubGistStorage (Media)");
+            throw new Error("gist credentials missing for Media storage");
+          }
+          mediaRepository = new ShardedNoteRepository_1.ShardedNoteRepository(
+            { token, username },
+            Storage_1.StorageModels.Media,
+            process.env.encryption_password ?? ""
+          );
+        } else {
+          mediaRepository = new DiskStorageRepositoryImpl_1.DiskStorageRepositoryImpl(Storage_1.StorageModels.Media);
+        }
+      }
+      return mediaRepository;
+    }
+    var index = /* @__PURE__ */ new Map();
+    async function indexAll() {
+      const repo = getMediaRepository();
+      const items = await repo.get();
+      index.clear();
+      for (const it of items) {
+        if (it && typeof it.mediaId === "string") {
+          index.set(it.mediaId, { item: it, at: Date.now() });
+        }
+      }
+    }
+    var ensured = false;
+    async function ensureIndex() {
+      if (ensured)
+        return;
+      await indexAll();
+      ensured = true;
+    }
+    async function putMedia({ mime, data }) {
+      if (typeof mime !== "string" || !/^image\/(png|jpeg|webp|gif)$|^audio\/(webm|ogg|mp4|mpeg)$/.test(mime))
+        throw new Error("unsupported media type");
+      if (typeof data !== "string" || !data.length)
+        throw new Error("empty media payload");
+      if (data.length > MEDIA_MAX_BASE64_CHARS)
+        throw new Error("media too large");
+      await ensureIndex();
+      const repo = getMediaRepository();
+      const mediaId = "m" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      const item = { mediaId, mime, data, bytes: Math.floor(data.length * 0.75), createdAt: (/* @__PURE__ */ new Date()).toISOString() };
+      await repo.add(item);
+      index.set(mediaId, { item, at: Date.now() });
+      if (index.size > 200) {
+        let oldestKey = null, oldestAt = Infinity;
+        for (const [k, v] of index) {
+          if (v.at < oldestAt) {
+            oldestAt = v.at;
+            oldestKey = k;
+          }
+        }
+        if (oldestKey && oldestKey !== mediaId) index.delete(oldestKey);
+      }
+      log.info(`media stored: ${mediaId} ${mime} ${item.bytes}B`);
+      return { mediaId, bytes: item.bytes };
+    }
+    async function getMedia(mediaId) {
+      if (typeof mediaId !== "string" || !/^m[0-9a-z]+$/.test(mediaId))
+        return null;
+      await ensureIndex();
+      let hit = index.get(mediaId);
+      if (!hit || !hit.item || typeof hit.item.data !== "string") {
+        const repo = getMediaRepository();
+        const found = (await repo.get()).find((it) => it && it.mediaId === mediaId);
+        if (!found) return null;
+        hit = { item: found, at: Date.now() };
+        index.set(mediaId, hit);
+      }
+      hit.at = Date.now();
+      return { mime: hit.item.mime, data: hit.item.data, bytes: hit.item.bytes };
+    }
+    async function removeMedia(mediaId) {
+      if (typeof mediaId !== "string") return false;
+      await ensureIndex();
+      const hit = index.get(mediaId);
+      if (hit) {
+        const repo2 = getMediaRepository();
+        await repo2.remove(hit.item.id);
+        index.delete(mediaId);
+        return true;
+      }
+      const repo = getMediaRepository();
+      const found = (await repo.get()).find((it) => it && it.mediaId === mediaId);
+      if (!found) return false;
+      await repo.remove(found.id);
+      return true;
+    }
+    async function removeAllMedia() {
+      const repo = getMediaRepository();
+      await repo.removeAll();
+      index.clear();
+    }
+    async function sweepListItems() {
+      await ensureIndex();
+      const repo = getMediaRepository();
+      const items = await repo.get();
+      return items.filter((it) => it && typeof it.mediaId === "string").map((it) => ({ id: it.id, mediaId: it.mediaId, createdAt: it.createdAt || "" }));
+    }
+    async function sweepRemoveById(durableId) {
+      const repo = getMediaRepository();
+      await repo.remove(durableId);
+    }
+    exports2.sweepListItems = sweepListItems;
+    exports2.sweepRemoveById = sweepRemoveById;
+    async function sweepUnreferenced(referenced, cutoffMs) {
+      await ensureIndex();
+      const repo = getMediaRepository();
+      const items = await repo.get();
+      let count = 0, keptRef2 = 0, keptFresh2 = 0;
+      for (const it of items) {
+        if (!it || typeof it.mediaId !== "string") continue;
+        if (referenced.has(it.mediaId)) {
+          keptRef2++;
+          continue;
+        }
+        const created = Date.parse(it.createdAt || "") || 0;
+        if (created > cutoffMs) {
+          keptFresh2++;
+          continue;
+        }
+        try {
+          await repo.remove(it.id);
+          count++;
+          index.delete(it.mediaId);
+        } catch (err) {
+          log.error(`media sweep: removing ${it.mediaId} failed: ${err.message}`);
+        }
+      }
+      return { count, keptRef: keptRef2, keptFresh: keptFresh2 };
+    }
+    exports2.sweepUnreferenced = sweepUnreferenced;
+    async function mediaInfo(mediaId) {
+      if (typeof mediaId !== "string" || !/^m[0-9a-z]+$/.test(mediaId))
+        return null;
+      await ensureIndex();
+      const hit = index.get(mediaId);
+      if (hit) return { mime: hit.item.mime, bytes: hit.item.bytes };
+      const found = (await getMediaRepository().get()).find((it) => it && it.mediaId === mediaId);
+      return found ? { mime: found.mime, bytes: found.bytes } : null;
+    }
+  }
+});
+
 // server/src/services/chatService.js
 var require_chatService = __commonJS({
   "server/src/services/chatService.js"(exports2) {
@@ -59359,6 +59534,12 @@ ${messages.length ? cards.join("\n") : `  <div class="msg">${escapeHtml(i18n.emp
     var deleteAllChat = async (res) => {
       const repository = (0, config_1.getMessageRepository)();
       await repository.removeAll();
+      try {
+        const mediaStore = require_mediaStore();
+        await mediaStore.removeAllMedia();
+      } catch (err) {
+        log.error("media cleanup after delete-all failed:", err.message);
+      }
     };
     exports2.deleteAllChat = deleteAllChat;
   }
@@ -59393,6 +59574,8 @@ var require_Setting = __commonJS({
       fsNotice: 1e5,
       /** fullscreen-notice confirm button label (plain text, short) */
       fsNoticeOkLabel: 60,
+      /** fullscreen-notice button position: left | center | right */
+      fsNoticeBtnAlign: 6,
       /** one username entry */
       username: 50,
       /** members of a selected-users list */
@@ -59514,6 +59697,15 @@ var require_Setting = __commonJS({
       attendanceViewMode;
       /** usernames allowed to open the attendance page when the mode is "selected" */
       attendanceSelected;
+      /** who may delete the whole chat history — "all" | "admin" | "selected" */
+      deleteChatMode;
+      /** usernames allowed to delete the whole history when deleteChatMode === "selected" */
+      deleteChatSelected;
+      /** who may send media messages (voice/photo) — "all" | "admin" | "selected";
+          admins always can (owner request 2026-11-09: per-feature media on/off) */
+      mediaMode;
+      /** usernames allowed to send media when mediaMode === "selected" */
+      mediaSelected;
       /** raw, admin-editiable html rendered by GET /attendance */
       attendanceHtml;
       /** shared plain-text note shown on the attendance page (admin + selected users) */
@@ -59524,6 +59716,8 @@ var require_Setting = __commonJS({
       fsNoticeUpdatedAt;
       /** custom text for the fullscreen-notice confirm button ("" = default) */
       fsNoticeOkLabel;
+      /** button position inside the fullscreen overlay: left (default) | center | right */
+      fsNoticeBtnAlign;
       /** where new chat messages persist: "gist" (durable, slower) | "memory"
           (server-local, fast — lost on restart/redeploy). User+Setting always
           persist in the gist regardless. */
@@ -59545,11 +59739,16 @@ var require_Setting = __commonJS({
         this.onlineUsersSelected = normalizeUsernames(json.onlineUsersSelected);
         this.attendanceViewMode = normalizeMode(json.attendanceViewMode, "admin") === "all" ? "admin" : normalizeMode(json.attendanceViewMode, "admin");
         this.attendanceSelected = normalizeUsernames(json.attendanceSelected);
+        this.deleteChatMode = normalizeMode(json.deleteChatMode, "admin");
+        this.deleteChatSelected = normalizeUsernames(json.deleteChatSelected);
+        this.mediaMode = normalizeMode(json.mediaMode, "all");
+        this.mediaSelected = normalizeUsernames(json.mediaSelected);
         this.attendanceHtml = typeof json.attendanceHtml === "string" ? json.attendanceHtml.slice(0, SETTING_LIMITS.attendanceHtml) : "";
         this.attendanceNote = typeof json.attendanceNote === "string" ? json.attendanceNote.slice(0, SETTING_LIMITS.attendanceNote) : "";
         this.fsNotice = typeof json.fsNotice === "string" ? json.fsNotice.slice(0, SETTING_LIMITS.fsNotice) : "";
         this.fsNoticeUpdatedAt = typeof json.fsNoticeUpdatedAt === "string" ? json.fsNoticeUpdatedAt : "";
         this.fsNoticeOkLabel = typeof json.fsNoticeOkLabel === "string" ? json.fsNoticeOkLabel.slice(0, SETTING_LIMITS.fsNoticeOkLabel) : "";
+        this.fsNoticeBtnAlign = json.fsNoticeBtnAlign === "center" || json.fsNoticeBtnAlign === "right" ? json.fsNoticeBtnAlign : "left";
         this.messageStoreMode = json.messageStoreMode === "gist" ? "gist" : "memory";
       }
     };
@@ -59671,6 +59870,16 @@ var require_permissions = __commonJS({
       setting?.attendanceSelected,
       user
     );
+    var canDeleteAllChat = (setting, user) => canUseFeature(
+      normalizeMode(setting?.deleteChatMode, "admin"),
+      setting?.deleteChatSelected,
+      user
+    );
+    var canUseMedia = (setting, user) => canUseFeature(
+      normalizeMode(setting?.mediaMode, "all"),
+      setting?.mediaSelected,
+      user
+    );
     var permissionSummary = (setting, user) => ({
       copyAllMode: normalizeMode(setting?.copyAllMode, "all"),
       copyAllSelectedCount: memberList(setting?.copyAllSelected).length,
@@ -59681,6 +59890,12 @@ var require_permissions = __commonJS({
       attendanceMode: normalizeMode(setting?.attendanceViewMode, "admin"),
       attendanceSelectedCount: memberList(setting?.attendanceSelected).length,
       canViewAttendance: canViewAttendance(setting, user),
+      deleteChatMode: normalizeMode(setting?.deleteChatMode, "admin"),
+      deleteChatSelectedCount: memberList(setting?.deleteChatSelected).length,
+      canDeleteAllChat: canDeleteAllChat(setting, user),
+      mediaMode: normalizeMode(setting?.mediaMode, "all"),
+      mediaSelectedCount: memberList(setting?.mediaSelected).length,
+      canUseMedia: canUseMedia(setting, user),
       hasAttendanceHtml: typeof setting?.attendanceHtml === "string" && setting.attendanceHtml.length > 0,
       version: isset(setting?.version) ? setting.version : void 0
     });
@@ -59690,14 +59905,20 @@ var require_permissions = __commonJS({
       showOnlineUsers: normalizeMode(setting?.showOnlineUsers, "all"),
       onlineUsersSelected: memberList(setting?.onlineUsersSelected),
       attendanceMode: normalizeMode(setting?.attendanceViewMode, "admin"),
-      attendanceSelected: memberList(setting?.attendanceSelected)
+      attendanceSelected: memberList(setting?.attendanceSelected),
+      deleteChatMode: normalizeMode(setting?.deleteChatMode, "admin"),
+      deleteChatSelected: memberList(setting?.deleteChatSelected),
+      mediaMode: normalizeMode(setting?.mediaMode, "all"),
+      mediaSelected: memberList(setting?.mediaSelected)
     });
     exports2.MODES = MODES;
     exports2.adminSettingsPayload = adminSettingsPayload;
     exports2.canSeeOnlineUsers = canSeeOnlineUsers;
     exports2.canUseCopyAll = canUseCopyAll;
+    exports2.canUseMedia = canUseMedia;
     exports2.canUseFeature = canUseFeature;
     exports2.canViewAttendance = canViewAttendance;
+    exports2.canDeleteAllChat = canDeleteAllChat;
     exports2.isListed = isListed;
     exports2.normalizeMode = normalizeMode;
     exports2.permissionSummary = permissionSummary;
@@ -59916,7 +60137,7 @@ var require_settingController = __commonJS({
       try {
         const repository = (0, config_1.getSettingRepository)();
         const setting = await getSetting();
-        const { copyAllMode, copyAllSelected, showOnlineUsers, onlineUsersSelected, attendanceViewMode, attendanceSelected } = req.body || {};
+        const { copyAllMode, copyAllSelected, showOnlineUsers, onlineUsersSelected, attendanceViewMode, attendanceSelected, deleteChatMode, deleteChatSelected, mediaMode, mediaSelected } = req.body || {};
         if (copyAllMode !== void 0) {
           if (!permissions_1.MODES.includes(copyAllMode))
             return res.sendStatus(400);
@@ -59939,6 +60160,20 @@ var require_settingController = __commonJS({
         }
         if (attendanceSelected !== void 0)
           setting.attendanceSelected = (0, Setting_1.normalizeUsernames)(attendanceSelected);
+        if (deleteChatMode !== void 0) {
+          if (!permissions_1.MODES.includes(deleteChatMode))
+            return res.sendStatus(400);
+          setting.deleteChatMode = deleteChatMode;
+        }
+        if (deleteChatSelected !== void 0)
+          setting.deleteChatSelected = (0, Setting_1.normalizeUsernames)(deleteChatSelected);
+        if (mediaMode !== void 0) {
+          if (!permissions_1.MODES.includes(mediaMode))
+            return res.sendStatus(400);
+          setting.mediaMode = mediaMode;
+        }
+        if (mediaSelected !== void 0)
+          setting.mediaSelected = (0, Setting_1.normalizeUsernames)(mediaSelected);
         await repository.update(setting);
         res.status(200).json((0, permissions_1.permissionSummary)(setting, req.session?.userInfo));
       } catch (error) {
@@ -60104,6 +60339,7 @@ var require_settingController = __commonJS({
           notice: setting.fsNotice || "",
           updatedAt: setting.fsNoticeUpdatedAt || "",
           okLabel: setting.fsNoticeOkLabel || "",
+          btnAlign: setting.fsNoticeBtnAlign === "center" || setting.fsNoticeBtnAlign === "right" ? setting.fsNoticeBtnAlign : "left",
           messageStoreMode: setting.messageStoreMode || "memory"
         });
       } catch (error) {
@@ -60118,12 +60354,14 @@ var require_settingController = __commonJS({
       try {
         const raw = typeof req.body?.notice === "string" ? req.body.notice : "";
         const okLabel = typeof req.body?.okLabel === "string" ? req.body.okLabel.trim().slice(0, Setting_1.SETTING_LIMITS.fsNoticeOkLabel) : "";
+        const btnAlign = req.body?.btnAlign === "center" || req.body?.btnAlign === "right" ? req.body.btnAlign : "left";
         if (raw.length > Setting_1.SETTING_LIMITS.fsNotice)
           return res.status(400).json({ errorMessage: "client_error.too_large_error" });
         const repository = (0, config_1.getSettingRepository)();
         const setting = await getSetting();
         setting.fsNotice = raw;
         setting.fsNoticeOkLabel = okLabel;
+        setting.fsNoticeBtnAlign = btnAlign;
         setting.fsNoticeUpdatedAt = (/* @__PURE__ */ new Date()).toISOString();
         if (req.body?.messageStoreMode === "memory" || req.body?.messageStoreMode === "gist") {
           const mode = req.body.messageStoreMode;
@@ -60195,7 +60433,7 @@ var require_settingController = __commonJS({
     };
     exports2.canWeChat = canWeChat;
     var deleteChat = async (req, res) => {
-      if (!req.session?.userInfo?.isAdmin)
+      if (!(0, permissions_1.canDeleteAllChat)(await getSetting(), req.session?.userInfo))
         return res.sendStatus(403);
       log.debug("Deleting all messages...");
       try {
@@ -60306,6 +60544,51 @@ var require_socketEvents = __commonJS({
   }
 });
 
+// server/src/models/Message.js
+var require_Message = __commonJS({
+  "server/src/models/Message.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.Message = void 0;
+    var BaseModel_1 = require_BaseModel();
+    var User_1 = require_User();
+    var ReplyTo = class {
+      id;
+      username;
+      text;
+      constructor(json) {
+        this.id = json.id;
+        this.text = typeof json.text === "string" ? json.text.substr(0, 50) : "";
+        this.username = json.username;
+      }
+    };
+    var Message = class extends BaseModel_1.BaseModel {
+      text;
+      username;
+      time;
+      replyTo;
+      edited_at;
+      role = User_1.RoleEnum.NON_ADMIN;
+      reactions;
+      /** attached media (voice/photo) — { mediaId, mime, seconds? }; the payload
+          itself lives in the media store, never inside the message */
+      media;
+      constructor(json = {}) {
+        super(json);
+        this.text = json.text || "";
+        this.username = json.username || "";
+        this.time = json.time || "";
+        this.replyTo = json.replyTo ? new ReplyTo(json.replyTo) : null;
+        this.reactions = json.reactions || {};
+        const m = json.media;
+        const MIME_OK = /^image\/(png|jpeg|webp|gif)$|^audio\/(webm|ogg|mp4|mpeg)$/;
+        this.media = m && typeof m === "object" && typeof m.mediaId === "string" && /^m[0-9a-z]+$/.test(m.mediaId) && typeof m.mime === "string" && m.mime.length <= 40 && MIME_OK.test(m.mime) ? { mediaId: m.mediaId, mime: m.mime, seconds: Number.isFinite(m.seconds) ? Math.round(m.seconds) : void 0 } : null;
+      }
+    };
+    exports2.Message = Message;
+  }
+});
+
 // server/src/socket/chatHandler.js
 var require_chatHandler = __commonJS({
   "server/src/socket/chatHandler.js"(exports2) {
@@ -60326,7 +60609,9 @@ var require_chatHandler = __commonJS({
     var ClientError_1 = require_ClientError();
     var SocketEvents_1 = require_socketEvents();
     var User_1 = require_User();
+    var Message_1 = require_Message();
     var htmlSanitizer_1 = require_htmlSanitizer();
+    var permissions_1 = require_permissions();
     var log = (0, logger_1.default)(__filename);
     function safeCallback(callback, payload) {
       if (typeof callback === "function")
@@ -60335,26 +60620,32 @@ var require_chatHandler = __commonJS({
     async function handleChatMessage(message, callback, socket) {
       log.debug(`Received chat message: ${JSON.stringify(message)}`);
       try {
-        if (!message?.text?.trim()) {
+        const normalized = new Message_1.Message(message);
+        const hasMedia = !!(normalized.media && normalized.media.mediaId);
+        message.media = normalized.media;
+        if (!message?.text?.trim() && !hasMedia) {
           safeCallback(callback, ClientError_1.ClientError.invalidError());
           return;
         }
-        if (message.text.length > htmlSanitizer_1.MAX_MESSAGE_CHARS) {
+        if (message.text && message.text.length > htmlSanitizer_1.MAX_MESSAGE_CHARS) {
           safeCallback(callback, ClientError_1.ClientError.tooLargeError());
           return;
         }
         const repository = (0, config_1.getMessageRepository)();
         message.username = socket.request.session.userInfo.username;
         message.role = socket.request.session.userInfo.isAdmin ? User_1.RoleEnum.ADMIN : User_1.RoleEnum.NON_ADMIN;
-        message.text = (0, htmlSanitizer_1.sanitizeMessageHtml)(message.text);
-        if (!message.text.trim()) {
+        normalized.text = message.text ? (0, htmlSanitizer_1.sanitizeMessageHtml)(message.text) : "";
+        normalized.username = message.username;
+        normalized.role = message.role;
+        normalized.time = message.time;
+        if ((!normalized.text || !normalized.text.trim()) && !hasMedia) {
           safeCallback(callback, ClientError_1.ClientError.invalidError());
           return;
         }
-        message.time = (/* @__PURE__ */ new Date()).toISOString();
-        const result = await repository.add(message);
+        normalized.time = (/* @__PURE__ */ new Date()).toISOString();
+        const result = await repository.add(normalized);
         safeCallback(callback, result);
-        socket.broadcast.emit(SocketEvents_1.socketEvents.chatMessage, message);
+        socket.broadcast.emit(SocketEvents_1.socketEvents.chatMessage, result);
       } catch (err) {
         log.error(err);
         safeCallback(callback, ClientError_1.ClientError.internalError());
@@ -60434,7 +60725,9 @@ var require_chatHandler = __commonJS({
     async function handleDeleteChat(socket, callback) {
       log.debug(`Received delete chat request.`);
       try {
-        if (!socket.request.session.userInfo.isAdmin) {
+        const setting = await (0, config_1.getSettingRepository)().get();
+        const allowed = permissions_1.canDeleteAllChat(setting[0], socket.request.session.userInfo);
+        if (!allowed) {
           safeCallback(callback, ClientError_1.ClientError.accessDeniedError());
           return;
         }
@@ -60459,6 +60752,14 @@ var require_chatHandler = __commonJS({
         if (!message) {
           safeCallback(callback, { status: false });
           return;
+        }
+        if (message.media && message.media.mediaId) {
+          try {
+            const mediaStore = require_mediaStore();
+            await mediaStore.removeMedia(message.media.mediaId);
+          } catch (err) {
+            log.error("media cleanup after delete failed:", err.message);
+          }
         }
         if (message.username != loggedInUser.username && !loggedInUser.isAdmin) {
           safeCallback(callback, ClientError_1.ClientError.accessDeniedError());
@@ -60633,45 +60934,6 @@ var require_userHandler = __commonJS({
   }
 });
 
-// server/src/models/Message.js
-var require_Message = __commonJS({
-  "server/src/models/Message.js"(exports2) {
-    "use strict";
-    Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.Message = void 0;
-    var BaseModel_1 = require_BaseModel();
-    var User_1 = require_User();
-    var ReplyTo = class {
-      id;
-      username;
-      text;
-      constructor(json) {
-        this.id = json.id;
-        this.text = typeof json.text === "string" ? json.text.substr(0, 50) : "";
-        this.username = json.username;
-      }
-    };
-    var Message = class extends BaseModel_1.BaseModel {
-      text;
-      username;
-      time;
-      replyTo;
-      edited_at;
-      role = User_1.RoleEnum.NON_ADMIN;
-      reactions;
-      constructor(json = {}) {
-        super(json);
-        this.text = json.text || "";
-        this.username = json.username || "";
-        this.time = json.time || "";
-        this.replyTo = json.replyTo ? new ReplyTo(json.replyTo) : null;
-        this.reactions = json.reactions || {};
-      }
-    };
-    exports2.Message = Message;
-  }
-});
-
 // server/src/socket/socketService.js
 var require_socketService = __commonJS({
   "server/src/socket/socketService.js"(exports2) {
@@ -60739,7 +61001,7 @@ var require_chatController = __commonJS({
       return mod && mod.__esModule ? mod : { "default": mod };
     };
     Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.exportChat = exports2.reactMessage = exports2.getMissingMessages = exports2.getMessages = void 0;
+    exports2.sendMessage = exports2.getMedia = exports2.uploadMedia = exports2.exportChat = exports2.reactMessage = exports2.getMissingMessages = exports2.getMessages = void 0;
     var socketService_1 = require_socketService();
     var SocketEvents_1 = require_socketEvents();
     var socketEvents_1 = require_socketEvents();
@@ -60748,6 +61010,9 @@ var require_chatController = __commonJS({
     var config_1 = require_repositoryFactory();
     var chatService_1 = require_chatService();
     var permissions_1 = require_permissions();
+    var Message_1 = require_Message();
+    var User_1 = require_User();
+    var htmlSanitizer_1 = require_htmlSanitizer();
     var log = (0, logger_1.default)(__filename);
     var clampLimit = (value) => {
       const n = parseInt(String(value ?? ""), 10);
@@ -60882,6 +61147,78 @@ var require_chatController = __commonJS({
         res.sendStatus(500);
       }
     };
+    var mediaStore_1 = require_mediaStore();
+    var uploadMedia = async (req, res) => {
+      try {
+        const user = req.session?.userInfo;
+        if (!user?.username)
+          return res.sendStatus(401);
+        const settings = await (0, config_1.getSettingRepository)().get();
+        if (!permissions_1.canUseMedia(settings[0], user))
+          return res.status(403).json({ message: "client_error.access_denied" });
+        const { mime, data } = req.body || {};
+        const out = await mediaStore_1.putMedia({ mime, data });
+        res.status(200).json(out);
+      } catch (error) {
+        if (/unsupported media type|empty media|too large/.test(String(error?.message)))
+          return res.status(400).json({ message: error.message });
+        log.error(error);
+        res.sendStatus(500);
+      }
+    };
+    exports2.uploadMedia = uploadMedia;
+    var getMedia = async (req, res) => {
+      try {
+        if (!req.session?.userInfo?.username)
+          return res.sendStatus(401);
+        const media = await mediaStore_1.getMedia(String(req.params.id || ""));
+        if (!media)
+          return res.sendStatus(404);
+        const buf = Buffer.from(media.data, "base64");
+        res.setHeader("Content-Type", media.mime);
+        res.setHeader("Content-Length", String(buf.length));
+        res.setHeader("Cache-Control", "private, max-age=86400");
+        res.status(200).end(buf);
+      } catch (error) {
+        log.error(error);
+        res.sendStatus(500);
+      }
+    };
+    exports2.getMedia = getMedia;
+    var sendMessage = async (req, res) => {
+      try {
+        const user = req.session?.userInfo;
+        if (!user?.username)
+          return res.sendStatus(401);
+        const raw = req.body || {};
+        const normalized = new Message_1.Message(raw);
+        const hasMedia = !!(normalized.media && normalized.media.mediaId);
+        const rawText = typeof raw?.text === "string" ? raw.text : "";
+        if (!rawText.trim() && !hasMedia)
+          throw ClientError_1.ClientError.invalidError();
+        if (rawText.length > htmlSanitizer_1.MAX_MESSAGE_CHARS)
+          throw ClientError_1.ClientError.tooLargeError();
+        const repository = (0, config_1.getMessageRepository)();
+        const message = {
+          text: rawText ? (0, htmlSanitizer_1.sanitizeMessageHtml)(rawText) : "",
+          username: user.username,
+          role: user.isAdmin ? User_1.RoleEnum.ADMIN : User_1.RoleEnum.NON_ADMIN,
+          replyTo: normalized.replyTo || null,
+          media: normalized.media || void 0,
+          time: (/* @__PURE__ */ new Date()).toISOString()
+        };
+        if ((!message.text || !message.text.trim()) && !hasMedia)
+          throw ClientError_1.ClientError.invalidError();
+        const result = await repository.add(message);
+        res.status(200).json(result);
+        const io = (0, socketService_1.getLiveIo)();
+        if (io)
+          io.emit(SocketEvents_1.socketEvents.chatMessage, result);
+      } catch (error) {
+        handleError(error, res);
+      }
+    };
+    exports2.sendMessage = sendMessage;
   }
 });
 
@@ -60940,7 +61277,10 @@ var require_apiRouter = __commonJS({
     router.put("/chat/saveFrequentSymbols", SettingController_1.saveFrequentSymbols);
     router.post("/chat/getMessages", ChatController_1.getMessages);
     router.post("/chat/getMissingMessages", ChatController_1.getMissingMessages);
+    router.post("/chat", ChatController_1.sendMessage);
     router.post("/chat/react", ChatController_1.reactMessage);
+    router.post("/chat/media", ChatController_1.uploadMedia);
+    router.get("/chat/media/:id", ChatController_1.getMedia);
     router.put("/chat/updateNotice", SettingController_1.updateNotice);
     router.get("/chat/getFsNotice", SettingController_1.getFsNotice);
     router.put("/chat/updateFsNotice", SettingController_1.updateFsNotice);
@@ -75790,6 +76130,62 @@ var require_dist3 = __commonJS({
   }
 });
 
+// server/src/services/mediaCleanup.js
+var require_mediaCleanup = __commonJS({
+  "server/src/services/mediaCleanup.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.MEDIA_RETENTION_DAYS = exports2.MEDIA_CLEANUP_INTERVAL_H = void 0;
+    exports2.collectReferencedMediaIds = collectReferencedMediaIds;
+    exports2.runMediaCleanup = runMediaCleanup;
+    exports2.startMediaCleanupLoop = startMediaCleanupLoop;
+    var logger_1 = require_logger2();
+    var config_1 = require_repositoryFactory();
+    var mediaStore_1 = require_mediaStore();
+    var log = (0, logger_1.default)(__filename);
+    var MEDIA_RETENTION_DAYS = Math.max(parseInt(process.env.MEDIA_RETENTION_DAYS || "30", 10), 1);
+    exports2.MEDIA_RETENTION_DAYS = MEDIA_RETENTION_DAYS;
+    var MEDIA_CLEANUP_INTERVAL_H = Math.max(parseInt(process.env.MEDIA_CLEANUP_INTERVAL_H || "24", 10), 1);
+    exports2.MEDIA_CLEANUP_INTERVAL_H = MEDIA_CLEANUP_INTERVAL_H;
+    async function collectReferencedMediaIds() {
+      const ids = /* @__PURE__ */ new Set();
+      try {
+        const items = await (0, config_1.getMessageRepository)().get();
+        for (const m of items) {
+          const id = m && m.media && m.media.mediaId;
+          if (typeof id === "string")
+            ids.add(id);
+        }
+      } catch (err) {
+        log.error("media cleanup: reading message history failed:", err.message);
+      }
+      return ids;
+    }
+    async function runMediaCleanup() {
+      const referenced = await collectReferencedMediaIds();
+      const cutoff = Date.now() - MEDIA_RETENTION_DAYS * 24 * 60 * 60 * 1e3;
+      const removed = await mediaStore_1.sweepUnreferenced(referenced, cutoff);
+      log.info(`media cleanup: removed ${removed.count}, kept referenced ${removed.keptRef}, kept fresh ${removed.keptFresh} (retention ${MEDIA_RETENTION_DAYS}d)`);
+      return removed.count;
+      log.info(`media cleanup: removed ${removed}, kept referenced ${keptRef}, kept fresh ${keptFresh} (retention ${MEDIA_RETENTION_DAYS}d)`);
+      return removed;
+    }
+    var started = false;
+    function startMediaCleanupLoop() {
+      if (started)
+        return;
+      started = true;
+      setTimeout(() => {
+        runMediaCleanup().catch((err) => log.error("media cleanup (boot) failed:", err.message));
+      }, 2 * 60 * 1e3);
+      setInterval(() => {
+        runMediaCleanup().catch((err) => log.error("media cleanup failed:", err.message));
+      }, MEDIA_CLEANUP_INTERVAL_H * 60 * 60 * 1e3);
+      log.info(`media auto-cleanup active: retention ${MEDIA_RETENTION_DAYS}d, every ${MEDIA_CLEANUP_INTERVAL_H}h`);
+    }
+  }
+});
+
 // server/src/www.js
 var require_www = __commonJS({
   "server/src/www.js"(exports2) {
@@ -75858,6 +76254,7 @@ var require_www = __commonJS({
     nodeServer.on("error", onError);
     nodeServer.on("listening", onListening);
     log.info("Server is listening on port  " + port);
+    require_mediaCleanup().startMediaCleanupLoop();
     function normalizePort(val) {
       const port2 = parseInt(val, 10);
       if (isNaN(port2)) {

@@ -37,7 +37,7 @@
   "use strict";
   if (window.__bcaTrayPicker) return;
   window.__bcaTrayPicker = true;
-  console.log("[bca] tray-picker v21 loaded"); // visible proof of the running version
+  // silent (owner request 2026-11-08: no console noise; version in the file header)
 
   let catalogue = null; // { categories: [{id, emojis:[{n, e}]}] }
   let catalogueLoading = null;

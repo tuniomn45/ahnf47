@@ -101,6 +101,9 @@ nodeServer.listen(port);
 nodeServer.on("error", onError);
 nodeServer.on("listening", onListening);
 log.info("Server is listening on port  " + port);
+// owner request 2026-11-08: daily sweep of unreferenced media older than the
+// retention window (default 30 days) — keeps the free-tier RAM/gist budget sane
+require("./services/mediaCleanup.js").startMediaCleanupLoop();
 /**
  * Normalize a port into a number, string, or false.
  */

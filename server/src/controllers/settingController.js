@@ -28,7 +28,7 @@ const saveAdminSettings = async (req, res) => {
     try {
         const repository = (0, config_1.getSettingRepository)();
         const setting = await getSetting();
-        const { copyAllMode, copyAllSelected, showOnlineUsers, onlineUsersSelected, attendanceViewMode, attendanceSelected, } = req.body || {};
+        const { copyAllMode, copyAllSelected, showOnlineUsers, onlineUsersSelected, attendanceViewMode, attendanceSelected, deleteChatMode, deleteChatSelected, mediaMode, mediaSelected, } = req.body || {};
         if (copyAllMode !== undefined) {
             if (!permissions_1.MODES.includes(copyAllMode))
                 return res.sendStatus(400);
@@ -55,6 +55,20 @@ const saveAdminSettings = async (req, res) => {
         }
         if (attendanceSelected !== undefined)
             setting.attendanceSelected = (0, Setting_1.normalizeUsernames)(attendanceSelected);
+        if (deleteChatMode !== undefined) {
+            if (!permissions_1.MODES.includes(deleteChatMode))
+                return res.sendStatus(400);
+            setting.deleteChatMode = deleteChatMode;
+        }
+        if (deleteChatSelected !== undefined)
+            setting.deleteChatSelected = (0, Setting_1.normalizeUsernames)(deleteChatSelected);
+        if (mediaMode !== undefined) {
+            if (!permissions_1.MODES.includes(mediaMode))
+                return res.sendStatus(400);
+            setting.mediaMode = mediaMode;
+        }
+        if (mediaSelected !== undefined)
+            setting.mediaSelected = (0, Setting_1.normalizeUsernames)(mediaSelected);
         await repository.update(setting);
         res.status(200).json((0, permissions_1.permissionSummary)(setting, req.session?.userInfo));
     }
@@ -246,6 +260,7 @@ const getFsNotice = async (req, res) => {
             notice: setting.fsNotice || "",
             updatedAt: setting.fsNoticeUpdatedAt || "",
             okLabel: setting.fsNoticeOkLabel || "",
+            btnAlign: setting.fsNoticeBtnAlign === "center" || setting.fsNoticeBtnAlign === "right" ? setting.fsNoticeBtnAlign : "left",
             messageStoreMode: setting.messageStoreMode || "memory",
         });
     }
@@ -264,12 +279,14 @@ const updateFsNotice = async (req, res) => {
     try {
         const raw = typeof req.body?.notice === "string" ? req.body.notice : "";
         const okLabel = typeof req.body?.okLabel === "string" ? req.body.okLabel.trim().slice(0, Setting_1.SETTING_LIMITS.fsNoticeOkLabel) : "";
+        const btnAlign = req.body?.btnAlign === "center" || req.body?.btnAlign === "right" ? req.body.btnAlign : "left";
         if (raw.length > Setting_1.SETTING_LIMITS.fsNotice)
             return res.status(400).json({ errorMessage: "client_error.too_large_error" });
         const repository = (0, config_1.getSettingRepository)();
         const setting = await getSetting();
         setting.fsNotice = raw;
         setting.fsNoticeOkLabel = okLabel;
+        setting.fsNoticeBtnAlign = btnAlign;
         setting.fsNoticeUpdatedAt = new Date().toISOString();
         // the message-store switch rides along with every fs-notice save —
         // the admin panel toggles it through this endpoint
@@ -349,7 +366,9 @@ const canWeChat = async (req, res) => {
 };
 exports.canWeChat = canWeChat;
 const deleteChat = async (req, res) => {
-    if (!req.session?.userInfo?.isAdmin)
+    // owner request 2026-11-08: deleting the whole history is a guarded
+    // FEATURE now (deleteChatMode admin|all|selected) — admins always can
+    if (!(0, permissions_1.canDeleteAllChat)(await getSetting(), req.session?.userInfo))
         return res.sendStatus(403);
     log.debug("Deleting all messages...");
     try {

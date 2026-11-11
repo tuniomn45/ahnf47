@@ -9,6 +9,8 @@ var StorageModels;
     StorageModels["Message"] = "Message";
     // synthetic model for the unlimited shared notepad (chunked storage)
     StorageModels["Note"] = "Note";
+    // synthetic model for chat media (voice/photos), one base64 payload per item
+    StorageModels["Media"] = "Media";
 })(StorageModels || (exports.StorageModels = StorageModels = {}));
 var StorageTypes;
 (function (StorageTypes) {
